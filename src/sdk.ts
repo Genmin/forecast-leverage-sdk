@@ -4,19 +4,30 @@ import { ethers, Wallet } from "ethers";
 /**
  * TURNKEY LEVERAGE SDK FOR POLYMARKET INTEGRATION
  *
- * Enables integrators to add leverage to Polymarket trading with a simple API:
- * - User picks: "YES 40¢ → 44¢ in 1 hour with $1000"
- * - SDK executes full leverage loop
- * - Returns complete position with all fees calculated
+ * Target-based UX: User picks "YES 40¢ → 44¢ in 1 hour with $1000"
+ * SDK handles everything else.
  *
- * Architecture:
- * 1. Calculate leverage parameters (F, loops, term)
- * 2. For each loop iteration:
- *    - Buy tokens on Polymarket (FOK order)
- *    - Wait for confirmation
- *    - Open protocol leg
- *    - Use borrowed USDC for next iteration
- * 3. Return position tracking all legs
+ * PROTOCOL MECHANICS (Critical):
+ *
+ * 1. COLLATERAL = 1 YES + 1 NO = always $1 (CTF guarantee)
+ *    - Each "set" of collateral has guaranteed $1 value
+ *    - User deposits LONG tokens, protocol borrows SHORT from junior pool
+ *
+ * 2. BORROWING:
+ *    - Against $1 collateral, protocol lends F * $1 USDC
+ *    - F = capital efficiency (typically 0.85-0.95)
+ *    - Example: 1000 tokens → borrow 900 USDC (F=0.9)
+ *
+ * 3. LOOP LEVERAGE:
+ *    - Buy tokens with capital C
+ *    - Loop: Deposit → borrow C*F → buy more → deposit → borrow C*F² → ...
+ *    - Max leverage = 1 / (1 - F) [geometric series]
+ *
+ * 4. RUNWAY:
+ *    - Debt per set: F * (1 + R * time/year)
+ *    - RUNWAY = time until debt hits $1
+ *    - Formula: runway = (1 - F) / (F * R) * year
+ *    - Term MUST be < runway
  */
 
 // Protocol ABIs
@@ -170,12 +181,13 @@ export class ForecastLeverageSDK {
       let remainingUSDC = params.capitalUSDC;
 
       for (let i = 0; i < leverageParams.loops; i++) {
-        // Estimate tokens from current capital
+        // Buy tokens at current price
         const tokensThisLoop = remainingUSDC / params.currentPrice;
         totalTokens += tokensThisLoop;
 
-        // Estimate borrowed USDC for next loop
-        remainingUSDC = tokensThisLoop * leverageParams.F * params.currentPrice;
+        // Protocol lends F per $1 of collateral (1 YES + 1 NO = $1)
+        // CRITICAL: Each token pair is worth $1, NOT token price
+        remainingUSDC = tokensThisLoop * leverageParams.F;
 
         if (remainingUSDC < 1) break;
       }
@@ -377,6 +389,31 @@ export class ForecastLeverageSDK {
   }
 
   /**
+   * Validate term doesn't exceed runway
+   * Runway = time until debt reaches $1 per set
+   * Debt formula: F * (1 + R * time/year)
+   * Runway when debt = 1: (1 - F) / (F * R) * year
+   */
+  private validateRunway(F: number, R: number, termSeconds: number): void {
+    if (R === 0) return; // Zero rates = infinite runway
+
+    const YEAR_SECONDS = 365 * 24 * 3600;
+    const runway = ((1 - F) / (F * R)) * YEAR_SECONDS;
+    const safeRunway = runway * 0.95; // 95% safety margin
+
+    if (termSeconds >= safeRunway) {
+      const termHours = termSeconds / 3600;
+      const runwayHours = safeRunway / 3600;
+
+      throw new ValidationError(
+        `Term ${termHours.toFixed(1)}h exceeds safe runway ${runwayHours.toFixed(1)}h. ` +
+        `Debt would exceed collateral value. ` +
+        `Try shorter timeframe or wait for lower rates.`
+      );
+    }
+  }
+
+  /**
    * Calculate leverage parameters from target
    */
   private async calculateLeverageParams(params: TargetPositionParams): Promise<LeverageParams> {
@@ -391,10 +428,17 @@ export class ForecastLeverageSDK {
     const F = Number(quote.F) / 1e18;
     const R = (Number(quote.rS) + Number(quote.rJ)) / 1e18;
 
-    // Calculate loops needed based on capital and F
-    // Geometric series: total_exposure = capital × 1/(1-F)
+    // Validate term doesn't exceed runway
+    this.validateRunway(F, R, params.timeframeSeconds);
+
+    // Calculate loops to reach ~90% of max leverage
+    // Geometric series: (1 - F^N) / (1 - F) approaches 1 / (1 - F)
+    // To reach 90%: F^N = 0.1, so N = log(0.1) / log(F)
     const maxLeverage = 1 / (1 - F);
-    const loops = Math.floor(Math.log(1 - maxLeverage * (1 - F)) / Math.log(F)) + 1;
+    const loops = Math.min(
+      Math.ceil(Math.log(0.1) / Math.log(F)),
+      10  // Safety cap
+    );
 
     // Get token ID from condition
     const tokenId = params.longYes
@@ -404,7 +448,7 @@ export class ForecastLeverageSDK {
     return {
       F,
       R,
-      loops: Math.min(loops, 10), // Cap at 10 loops for safety
+      loops,  // Already capped above
       maxLeverage,
       tokenId,
     };
