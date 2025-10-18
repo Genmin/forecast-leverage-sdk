@@ -185,9 +185,9 @@ export class ForecastLeverageSDK {
         const tokensThisLoop = remainingUSDC / params.currentPrice;
         totalTokens += tokensThisLoop;
 
-        // Protocol lends F per $1 of collateral (1 YES + 1 NO = $1)
-        // CRITICAL: Each token pair is worth $1, NOT token price
-        remainingUSDC = tokensThisLoop * leverageParams.F;
+        // Simplified leverage model: borrow F * (token value) in USDC
+        // This creates convergent geometric series: capital * (1-F^n)/(1-F)
+        remainingUSDC = tokensThisLoop * leverageParams.F * params.currentPrice;
 
         if (remainingUSDC < 1) break;
       }
