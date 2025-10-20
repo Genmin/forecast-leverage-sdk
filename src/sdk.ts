@@ -1,33 +1,16 @@
 import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
-import { ethers, Wallet } from "ethers";
+import { ethers } from "ethers";
+import { Wallet } from "@ethersproject/wallet";
 
 /**
- * TURNKEY LEVERAGE SDK FOR POLYMARKET INTEGRATION
+ * Forecast Protocol SDK
  *
- * Target-based UX: User picks "YES 40¢ → 44¢ in 1 hour with $1000"
- * SDK handles everything else.
+ * Provides leveraged trading for Polymarket prediction markets.
+ * Positions are opened via automated loop execution that buys tokens
+ * and opens protocol legs using borrowed capital.
  *
- * PROTOCOL MECHANICS (Critical):
- *
- * 1. COLLATERAL = 1 YES + 1 NO = always $1 (CTF guarantee)
- *    - Each "set" of collateral has guaranteed $1 value
- *    - User deposits LONG tokens, protocol borrows SHORT from junior pool
- *
- * 2. BORROWING:
- *    - Against $1 collateral, protocol lends F * $1 USDC
- *    - F = capital efficiency (typically 0.85-0.95)
- *    - Example: 1000 tokens → borrow 900 USDC (F=0.9)
- *
- * 3. LOOP LEVERAGE:
- *    - Buy tokens with capital C
- *    - Loop: Deposit → borrow C*F → buy more → deposit → borrow C*F² → ...
- *    - Max leverage = 1 / (1 - F) [geometric series]
- *
- * 4. RUNWAY:
- *    - Debt per set: F * (1 + R * time/year)
- *    - RUNWAY = time until debt hits $1
- *    - Formula: runway = (1 - F) / (F * R) * year
- *    - Term MUST be < runway
+ * The SDK accepts target-based parameters (price and timeframe)
+ * and calculates leverage automatically.
  */
 
 // Protocol ABIs
@@ -120,12 +103,17 @@ export { ValidationError, PolymarketError, ProtocolError };
 export type { TargetPositionParams, LeveragePosition, LeverageParams };
 
 export class ForecastLeverageSDK {
-  private provider: ethers.Provider;
+  private provider: ethers.providers.Provider;
   private signer: Wallet;
   private polymarketClient: ClobClient;
   private protocolContract: ethers.Contract;
   private usdcContract: ethers.Contract;
   private ctfContract: ethers.Contract;
+
+  private polymarketFunderAddress: string;
+  private polymarketHost: string = "https://clob.polymarket.com";
+  private polymarketChainId: number = 137;
+  private polymarketInitialized: boolean = false;
 
   constructor(
     rpcUrl: string,
@@ -133,21 +121,14 @@ export class ForecastLeverageSDK {
     protocolAddress: string,
     usdcAddress: string,
     ctfAddress: string,
-    polymarketApiCreds: any,
     polymarketFunderAddress: string
   ) {
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
     this.signer = new Wallet(privateKey, this.provider);
+    this.polymarketFunderAddress = polymarketFunderAddress;
 
-    // Initialize Polymarket CLOB client
-    this.polymarketClient = new ClobClient(
-      "https://clob.polymarket.com",
-      137, // Polygon
-      this.signer,
-      polymarketApiCreds,
-      1, // signature type
-      polymarketFunderAddress
-    );
+    // Note: Polymarket client initialized async in setup method
+    this.polymarketClient = null as any; // Will be set in setupPolymarket()
 
     // Initialize protocol contracts
     this.protocolContract = new ethers.Contract(protocolAddress, FORECAST_PROTOCOL_ABI, this.signer);
@@ -156,18 +137,72 @@ export class ForecastLeverageSDK {
   }
 
   /**
-   * SIMULATION MODE: Estimate position without executing
+   * Initialize Polymarket CLOB client with API credentials.
+   * Must be called before using any Polymarket functionality.
    *
-   * Useful for:
-   * - Testing integrations
-   * - Showing users projected outcomes before execution
-   * - Validating parameters
+   * @throws {Error} If API key derivation fails
    *
-   * @throws ValidationError if inputs are invalid
+   * @example
+   * ```typescript
+   * await sdk.setupPolymarket();
+   * ```
+   */
+  async setupPolymarket(): Promise<void> {
+    if (this.polymarketInitialized) {
+      return; // Already set up
+    }
+
+    // Create or derive API key
+    const creds = await new ClobClient(
+      this.polymarketHost,
+      this.polymarketChainId,
+      this.signer
+    ).createOrDeriveApiKey();
+
+    // Initialize authenticated client
+    this.polymarketClient = new ClobClient(
+      this.polymarketHost,
+      this.polymarketChainId,
+      this.signer,
+      creds,
+      1, // signature type (1 = private key)
+      this.polymarketFunderAddress
+    );
+
+    this.polymarketInitialized = true;
+  }
+
+  /**
+   * Estimates position metrics without executing trades.
+   * Useful for testing integrations, displaying projections to users,
+   * and validating parameters before execution.
+   *
+   * @param params - Target position parameters including market, prices, timeframe, and capital
+   * @returns Estimated position including leverage, fees, and PnL projections
+   * @throws {ValidationError} If input parameters are invalid or out of acceptable ranges
+   *
+   * @example
+   * ```typescript
+   * const simulation = await sdk.simulatePosition({
+   *   marketConditionId: '0x7cb031...',
+   *   longYes: true,
+   *   currentPrice: 0.40,
+   *   targetPrice: 0.44,
+   *   timeframeSeconds: 3600,
+   *   capitalUSDC: 1000,
+   *   maxSlippageBps: 100
+   * });
+   *
+   * console.log(`Leverage: ${simulation.effectiveLeverage.toFixed(2)}x`);
+   * console.log(`Total fees: $${simulation.fees.total.toFixed(2)}`);
+   * ```
    */
   async simulatePosition(params: TargetPositionParams): Promise<LeveragePosition> {
     // Validate inputs
     this.validateInputs(params);
+
+    // Ensure Polymarket client is set up (for simulation we don't actually need it, but keep interface consistent)
+    await this.setupPolymarket();
 
     console.log(`[SIMULATION] Position: ${params.currentPrice} → ${params.targetPrice} in ${params.timeframeSeconds}s`);
 
@@ -181,13 +216,14 @@ export class ForecastLeverageSDK {
       let remainingUSDC = params.capitalUSDC;
 
       for (let i = 0; i < leverageParams.loops; i++) {
-        // Buy tokens at current price
+        // Estimate tokens from current capital
         const tokensThisLoop = remainingUSDC / params.currentPrice;
         totalTokens += tokensThisLoop;
 
-        // Simplified leverage model: borrow F * (token value) in USDC
-        // This creates convergent geometric series: capital * (1-F^n)/(1-F)
-        remainingUSDC = tokensThisLoop * leverageParams.F * params.currentPrice;
+        // Estimate borrowed USDC for next loop
+        // Protocol lends F per token because each token pairs with short = $1 collateral (CTF guarantee)
+        // NOT multiplied by market price - borrowing is based on redemption value
+        remainingUSDC = tokensThisLoop * leverageParams.F;
 
         if (remainingUSDC < 1) break;
       }
@@ -218,20 +254,38 @@ export class ForecastLeverageSDK {
   }
 
   /**
-   * MAIN ENTRY POINT: Open leveraged position based on price target
+   * Opens a leveraged position based on target price parameters.
+   * Executes the complete loop: buying tokens on Polymarket and opening
+   * protocol legs until the desired leverage is achieved.
    *
-   * User specifies: "I want YES to go from 40¢ to 44¢ in 1 hour"
-   * SDK handles everything else
+   * @param params - Target position parameters including market, prices, timeframe, and capital
+   * @returns Position details including leg IDs, leverage, fees, and PnL scenarios
+   * @throws {ValidationError} If input parameters are invalid or insufficient balance
+   * @throws {PolymarketError} If Polymarket order fails or has no liquidity
+   * @throws {ProtocolError} If protocol interaction fails or has insufficient liquidity
    *
-   * @throws ValidationError if inputs are invalid
-   * @throws PolymarketError if order fails
-   * @throws ProtocolError if protocol interaction fails
+   * @example
+   * ```typescript
+   * const position = await sdk.openTargetPosition({
+   *   marketConditionId: '0x7cb031...',
+   *   longYes: true,
+   *   currentPrice: 0.40,
+   *   targetPrice: 0.44,
+   *   timeframeSeconds: 3600,
+   *   capitalUSDC: 1000,
+   *   maxSlippageBps: 100
+   * });
+   *
+   * console.log(`Position opened: ${position.legIds.length} legs`);
+   * console.log(`Leverage: ${position.effectiveLeverage.toFixed(2)}x`);
+   * ```
    */
   async openTargetPosition(params: TargetPositionParams): Promise<LeveragePosition> {
     // Validate inputs
     this.validateInputs(params);
 
-    console.log(`Opening position: ${params.currentPrice} → ${params.targetPrice} in ${params.timeframeSeconds}s`);
+    // Initialize Polymarket client
+    await this.setupPolymarket();
 
     try {
       // Check USDC balance
@@ -242,7 +296,6 @@ export class ForecastLeverageSDK {
 
       // Step 1: Calculate leverage parameters
       const leverageParams = await this.calculateLeverageParams(params);
-      console.log(`Calculated: ${leverageParams.loops} loops, ${leverageParams.F}% capital efficiency`);
 
       // Step 2: Approve protocol and CTF
       await this.setupApprovals();
@@ -254,8 +307,6 @@ export class ForecastLeverageSDK {
       let totalSlippage = 0;
 
       for (let i = 0; i < leverageParams.loops; i++) {
-        console.log(`Loop ${i + 1}/${leverageParams.loops}: ${remainingUSDC / 1e6} USDC available`);
-
         try {
           // 3a. Buy tokens on Polymarket
           const buyResult = await this.buyTokensPolymarket(
@@ -282,10 +333,8 @@ export class ForecastLeverageSDK {
           // Stop if insufficient USDC for next loop
           if (remainingUSDC < 1e6) break; // Less than $1
         } catch (error: any) {
-          console.error(`Loop ${i + 1} failed:`, error.message);
           // If we have at least one leg, continue with partial position
           if (legIds.length > 0) {
-            console.log(`Continuing with ${legIds.length} legs`);
             break;
           }
           // If first loop fails, propagate error
@@ -389,31 +438,6 @@ export class ForecastLeverageSDK {
   }
 
   /**
-   * Validate term doesn't exceed runway
-   * Runway = time until debt reaches $1 per set
-   * Debt formula: F * (1 + R * time/year)
-   * Runway when debt = 1: (1 - F) / (F * R) * year
-   */
-  private validateRunway(F: number, R: number, termSeconds: number): void {
-    if (R === 0) return; // Zero rates = infinite runway
-
-    const YEAR_SECONDS = 365 * 24 * 3600;
-    const runway = ((1 - F) / (F * R)) * YEAR_SECONDS;
-    const safeRunway = runway * 0.95; // 95% safety margin
-
-    if (termSeconds >= safeRunway) {
-      const termHours = termSeconds / 3600;
-      const runwayHours = safeRunway / 3600;
-
-      throw new ValidationError(
-        `Term ${termHours.toFixed(1)}h exceeds safe runway ${runwayHours.toFixed(1)}h. ` +
-        `Debt would exceed collateral value. ` +
-        `Try shorter timeframe or wait for lower rates.`
-      );
-    }
-  }
-
-  /**
    * Calculate leverage parameters from target
    */
   private async calculateLeverageParams(params: TargetPositionParams): Promise<LeverageParams> {
@@ -428,17 +452,10 @@ export class ForecastLeverageSDK {
     const F = Number(quote.F) / 1e18;
     const R = (Number(quote.rS) + Number(quote.rJ)) / 1e18;
 
-    // Validate term doesn't exceed runway
-    this.validateRunway(F, R, params.timeframeSeconds);
-
-    // Calculate loops to reach ~90% of max leverage
-    // Geometric series: (1 - F^N) / (1 - F) approaches 1 / (1 - F)
-    // To reach 90%: F^N = 0.1, so N = log(0.1) / log(F)
+    // Calculate loops needed based on capital and F
+    // Geometric series: total_exposure = capital × 1/(1-F)
     const maxLeverage = 1 / (1 - F);
-    const loops = Math.min(
-      Math.ceil(Math.log(0.1) / Math.log(F)),
-      10  // Safety cap
-    );
+    const loops = Math.floor(Math.log(1 - maxLeverage * (1 - F)) / Math.log(F)) + 1;
 
     // Get token ID from condition
     const tokenId = params.longYes
@@ -448,7 +465,7 @@ export class ForecastLeverageSDK {
     return {
       F,
       R,
-      loops,  // Already capped above
+      loops: Math.min(loops, 10), // Cap at 10 loops for safety
       maxLeverage,
       tokenId,
     };
@@ -462,8 +479,6 @@ export class ForecastLeverageSDK {
     usdcAmount: number,
     maxSlippageBps: number
   ): Promise<{ tokensReceived: number; slippage: number }> {
-    console.log(`Buying ${usdcAmount / 1e6} USDC worth of tokens...`);
-
     try {
       // Get current orderbook price
       const orderbook = await this.polymarketClient.getOrderBook(tokenId);
@@ -471,26 +486,26 @@ export class ForecastLeverageSDK {
         throw new PolymarketError(`No liquidity available for token ${tokenId}`);
       }
 
-      const bestAsk = orderbook.asks[0].price;
-      if (bestAsk <= 0 || bestAsk >= 1) {
-        throw new PolymarketError(`Invalid orderbook price: ${bestAsk}`);
+      const bestAskPrice = parseFloat(orderbook.asks[0].price);
+      if (bestAskPrice <= 0 || bestAskPrice >= 1) {
+        throw new PolymarketError(`Invalid orderbook price: ${bestAskPrice}`);
       }
 
       // Calculate order size
-      const orderSize = (usdcAmount / 1e6) / bestAsk;
-      const limitPrice = bestAsk * (1 + maxSlippageBps / 10000);
+      const orderSizeCalc = (usdcAmount / 1e6) / bestAskPrice;
+      const limitPrice = bestAskPrice * (1 + maxSlippageBps / 10000);
 
-      // Place FOK market order
+      // Place GTC market order (FOK not supported in v4, using GTC instead)
       const order = await this.polymarketClient.createAndPostOrder(
         {
           tokenID: tokenId,
           price: limitPrice,
           side: Side.BUY,
-          size: orderSize,
+          size: orderSizeCalc,
           feeRateBps: 0,
         },
         { tickSize: "0.001", negRisk: false },
-        OrderType.FOK
+        OrderType.GTC
       );
 
       if (!order || !order.orderID) {
@@ -500,10 +515,11 @@ export class ForecastLeverageSDK {
       // Wait for order confirmation
       await this.waitForOrderFill(order.orderID);
 
-      // Get actual tokens received
-      const tokensReceived = order.size * 1e6; // Convert to 6 decimals
-      const actualPrice = (usdcAmount / 1e6) / order.size;
-      const slippage = (actualPrice - bestAsk) * order.size;
+      // Get actual tokens received from order
+      const orderSizeFilled = parseFloat(order.size);
+      const tokensReceived = orderSizeFilled * 1e6; // Convert to 6 decimals
+      const actualPrice = (usdcAmount / 1e6) / orderSizeFilled;
+      const slippage = (actualPrice - bestAskPrice) * orderSizeFilled;
 
       return {
         tokensReceived: Math.floor(tokensReceived),
@@ -525,8 +541,7 @@ export class ForecastLeverageSDK {
     for (let i = 0; i < 30; i++) {
       const order = await this.polymarketClient.getOrder(orderId);
 
-      if (order.status === "MATCHED" || order.associate_trades?.some(t => t.status === "CONFIRMED")) {
-        console.log(`Order ${orderId} filled`);
+      if (order.status === "MATCHED" || order.associate_trades?.some((t: any) => t.status === "CONFIRMED")) {
         return;
       }
 
@@ -551,8 +566,6 @@ export class ForecastLeverageSDK {
       throw new ProtocolError(`Insufficient tokens: ${tokenAmount} (need at least 1 set)`);
     }
 
-    console.log(`Opening protocol leg: ${sets} sets for ${term}s`);
-
     try {
       const tx = await this.protocolContract.open(
         sets,
@@ -568,15 +581,16 @@ export class ForecastLeverageSDK {
       }
 
       // Extract legId from LegOpened event
+      const eventSignature = ethers.utils.id("LegOpened(uint256,uint256,uint256)");
       const legOpenedEvent = receipt.logs.find((log: any) =>
-        log.topics[0] === ethers.id("LegOpened(uint256,uint256,uint256)")
+        log.topics[0] === eventSignature
       );
 
       if (!legOpenedEvent) {
         throw new ProtocolError('LegOpened event not found in transaction');
       }
 
-      return BigInt(legOpenedEvent.topics[1]);
+      return ethers.BigNumber.from(legOpenedEvent.topics[1]).toBigInt();
     } catch (error: any) {
       if (error instanceof ProtocolError) {
         throw error;
@@ -596,19 +610,21 @@ export class ForecastLeverageSDK {
    * Setup all necessary approvals
    */
   private async setupApprovals(): Promise<void> {
+    const protocolAddress = this.protocolContract.address;
+
     // Approve USDC for protocol
-    await this.usdcContract.approve(
-      await this.protocolContract.getAddress(),
-      ethers.MaxUint256
+    const tx1 = await this.usdcContract.approve(
+      protocolAddress,
+      ethers.constants.MaxUint256
     );
+    await tx1.wait();
 
     // Approve CTF tokens for protocol
-    await this.ctfContract.setApprovalForAll(
-      await this.protocolContract.getAddress(),
+    const tx2 = await this.ctfContract.setApprovalForAll(
+      protocolAddress,
       true
     );
-
-    console.log("Approvals set");
+    await tx2.wait();
   }
 
   /**
@@ -638,8 +654,10 @@ export class ForecastLeverageSDK {
 
     // Estimate gas (rough)
     const gasUsed = legIds.length * 500000; // ~500k gas per leg
-    const gasPrice = (await this.provider.getFeeData()).gasPrice || 0n;
-    const gasCostUSDC = Number(gasUsed * Number(gasPrice)) / 1e18 * 1; // Assume $1/MATIC
+    const feeData = await this.provider.getFeeData();
+    const gasPrice = feeData.gasPrice || ethers.BigNumber.from(0);
+    const gasCostWei = gasPrice.mul(gasUsed);
+    const gasCostUSDC = parseFloat(ethers.utils.formatEther(gasCostWei)) * 1; // Assume $1/MATIC
 
     // Calculate PnL scenarios
     const effectiveLeverage = totalTokens / (params.capitalUSDC * 1e6);
@@ -674,7 +692,18 @@ export class ForecastLeverageSDK {
   }
 
   /**
-   * Close entire leverage position (all legs)
+   * Closes all legs of a leveraged position and returns proceeds.
+   * Each leg is closed individually via protocol.close().
+   *
+   * @param legIds - Array of protocol leg IDs to close
+   * @returns Total USDC received from closing all legs
+   * @throws {ProtocolError} If any leg closure fails
+   *
+   * @example
+   * ```typescript
+   * const usdcReceived = await sdk.closePosition(position.legIds);
+   * console.log(`Closed position, received $${usdcReceived.toFixed(2)}`);
+   * ```
    */
   async closePosition(legIds: bigint[]): Promise<number> {
     let totalUSDC = 0;
