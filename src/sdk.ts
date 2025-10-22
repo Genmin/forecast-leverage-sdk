@@ -452,10 +452,13 @@ export class ForecastLeverageSDK {
     const F = Number(quote.F) / 1e18;
     const R = (Number(quote.rS) + Number(quote.rJ)) / 1e18;
 
-    // Calculate loops needed based on capital and F
-    // Geometric series: total_exposure = capital × 1/(1-F)
+    // Calculate loops needed based on F
+    // Each loop adds F^n of original capital, so we loop until F^n < 0.01 (1% threshold)
+    // Formula: n = -ln(0.01) / ln(F)
     const maxLeverage = 1 / (1 - F);
-    const loops = Math.floor(Math.log(1 - maxLeverage * (1 - F)) / Math.log(F)) + 1;
+    const loops = F > 0 && F < 1
+      ? Math.ceil(-Math.log(0.01) / Math.log(F))
+      : 10; // Fallback to 10 loops if F is invalid
 
     // Get token ID from condition
     const tokenId = params.longYes
