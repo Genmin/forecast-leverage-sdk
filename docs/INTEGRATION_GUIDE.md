@@ -9,7 +9,7 @@ Users specify price targets and timeframes. The SDK calculates the required leve
 ## Quick Start
 
 ```typescript
-import { ForecastLeverageSDK } from "./ForecastLeverageSDK";
+import { ForecastLeverageSDK } from '@forecast-protocol/sdk';
 
 const sdk = new ForecastLeverageSDK(
   "https://polygon-rpc.com",
@@ -281,38 +281,6 @@ Polymarket API has rate limits:
 - Use EIP-2612 permits where possible
 - Consider gas price for profitability
 
-## Advanced Features
-
-### Custom Loop Strategy
-
-Override default loop calculation:
-
-```typescript
-const position = await sdk.openTargetPosition({
-  ...params,
-  customLoops: 3, // Force exactly 3 loops
-});
-```
-
-### Partial Close
-
-Close some legs, keep others:
-
-```typescript
-await sdk.closePosition(position.legIds.slice(0, 2)); // Close first 2 legs
-```
-
-### Real-Time Updates
-
-Subscribe to WebSocket for position updates:
-
-```typescript
-const ws = sdk.subscribeToPosition(position.legIds);
-ws.on('priceUpdate', (price) => {
-  // Update UI with current PnL
-});
-```
-
 ## Troubleshooting
 
 "Order failed to fill"
@@ -336,14 +304,8 @@ ws.on('priceUpdate', (price) => {
 
 Polygon Mainnet:
 ```
-Protocol: TBD (deploy to mainnet)
 USDC: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
 CTF: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
-Polymarket Exchange: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
 ```
 
-## Support
-
-- Documentation: https://docs.forecast.protocol
-- Discord: TBD
-- GitHub: TBD
+Protocol address provided at deployment.

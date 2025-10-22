@@ -54,11 +54,11 @@ git remote add origin git@github.com:Genmin/forecast-leverage-sdk.git
 git add .
 git commit -m "Initial release v1.0.0
 
-- Complete leverage SDK
+- Leverage SDK
 - Target-based UX
-- Comprehensive validation
+- Input validation
 - 19 test suite
-- Full documentation
+- Documentation
 - CI/CD configured"
 
 git push -u origin main

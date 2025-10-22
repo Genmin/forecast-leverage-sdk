@@ -37,7 +37,7 @@ const position = await sdk.openTargetPosition({
 
 ## Documentation
 
-See [INTEGRATION_GUIDE.md](./INTEGRATION_GUIDE.md) for complete integration instructions.
+See [INTEGRATION_GUIDE.md](./docs/INTEGRATION_GUIDE.md) for integration instructions.
 
 ## Testing
 
