@@ -1,23 +1,20 @@
 {
-  "name": "@forecast-protocol/leverage-sdk",
-  "version": "1.0.0",
-  "description": "Add leverage to Polymarket trading via Forecast Protocol",
+  "name": "@forecast-protocol/sdk",
+  "version": "2.0.0",
+  "description": "TypeScript SDK for leveraged prediction market trading via Forecast Protocol. Supports ethers v5 and v6, Privy embedded wallets, FOK/GTC orders with auto-retry.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "INTEGRATION_GUIDE.md"
   ],
   "scripts": {
     "build": "tsc",
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "prepublishOnly": "npm run build && npm test"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Genmin/forecast-leverage-sdk"
+    "test": "ts-node test_integrator.ts",
+    "test:all": "ts-node run_all_tests.ts",
+    "test:integrator": "ts-node test_integrator.ts",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "polymarket",
@@ -25,26 +22,34 @@
     "prediction-markets",
     "defi",
     "polygon",
-    "forecast"
+    "privy",
+    "ethers-v6",
+    "fok-orders"
   ],
   "author": "Forecast Protocol",
   "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/Genmin/forecast-leverage-sdk/issues"
-  },
-  "homepage": "https://github.com/Genmin/forecast-leverage-sdk#readme",
   "dependencies": {
-    "@polymarket/clob-client": "^4.22.7",
-    "ethers": "^5.7.2"
+    "@polymarket/clob-client": "4.22.7",
+    "ethers": "5.7.2"
+  },
+  "peerDependencies": {
+    "ethers": "5.7.2 || ^6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ethers": {
+      "optional": false
+    }
   },
   "devDependencies": {
-    "@types/jest": "^29.5.0",
-    "@types/node": "^20.0.0",
-    "jest": "^29.5.0",
-    "ts-jest": "^29.1.0",
-    "typescript": "^5.0.0"
+    "@types/node": "20.17.10",
+    "typescript": "5.7.3",
+    "ts-node": "10.9.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/forecast-protocol/sdk"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }

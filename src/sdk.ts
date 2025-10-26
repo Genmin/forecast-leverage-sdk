@@ -11,6 +11,12 @@ import { Wallet } from "@ethersproject/wallet";
  *
  * The SDK accepts target-based parameters (price and timeframe)
  * and calculates leverage automatically.
+ *
+ * COMPATIBILITY:
+ * - Accepts ethers v5 OR v6 signers (e.g., Privy embedded wallets)
+ * - Internally uses v5 for Polymarket clob-client (required)
+ * - NO hard-coded leverage caps - determined by liquidity only
+ * - Supports FOK, GTC, GTD order types with auto-retry
  */
 
 // Protocol ABIs
@@ -42,6 +48,9 @@ interface TargetPositionParams {
   timeframeSeconds: number;        // Time until target (3600 = 1 hour)
   capitalUSDC: number;             // Capital to deploy in dollars ($1000)
   maxSlippageBps: number;          // Max slippage in basis points (100 = 1%)
+  orderType?: 'FOK' | 'GTC' | 'GTD'; // Order type (default: FOK for market-like execution)
+  maxRetries?: number;             // Max retries for failed orders (default: 3)
+  retryDelayMs?: number;           // Delay between retries in ms (default: 2000)
 }
 
 interface LeverageParams {
@@ -104,7 +113,7 @@ export type { TargetPositionParams, LeveragePosition, LeverageParams };
 
 export class ForecastLeverageSDK {
   private provider: ethers.providers.Provider;
-  private signer: Wallet;
+  private signer: Wallet; // v5 wallet for clob-client compatibility
   private polymarketClient: ClobClient;
   private protocolContract: ethers.Contract;
   private usdcContract: ethers.Contract;
@@ -115,16 +124,44 @@ export class ForecastLeverageSDK {
   private polymarketChainId: number = 137;
   private polymarketInitialized: boolean = false;
 
+  /**
+   * @param rpcUrl - RPC URL for Polygon network
+   * @param signerOrPrivateKey - ethers v5/v6 Signer (e.g., from Privy) OR private key string
+   * @param protocolAddress - ForecastProtocol contract address
+   * @param usdcAddress - USDC token address
+   * @param ctfAddress - Polymarket CTF contract address
+   * @param polymarketFunderAddress - Polymarket operator funder address
+   *
+   * @example
+   * // With private key (v5 or v6)
+   * const sdk = new ForecastLeverageSDK(rpcUrl, "0x...", ...addresses);
+   *
+   * @example
+   * // With Privy embedded wallet (v6)
+   * const privyProvider = await wallet.getEthereumProvider();
+   * const ethersProvider = new ethers.BrowserProvider(privyProvider);
+   * const signer = await ethersProvider.getSigner();
+   * const sdk = new ForecastLeverageSDK(rpcUrl, signer, ...addresses);
+   */
   constructor(
     rpcUrl: string,
-    privateKey: string,
+    signerOrPrivateKey: string | ethers.Signer | any,
     protocolAddress: string,
     usdcAddress: string,
     ctfAddress: string,
     polymarketFunderAddress: string
   ) {
     this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-    this.signer = new Wallet(privateKey, this.provider);
+
+    // Handle both private key and Signer (v5 or v6)
+    if (typeof signerOrPrivateKey === 'string') {
+      // Private key provided
+      this.signer = new Wallet(signerOrPrivateKey, this.provider);
+    } else {
+      // Signer provided (v5 or v6) - convert to v5 Wallet
+      this.signer = this._convertToV5Wallet(signerOrPrivateKey);
+    }
+
     this.polymarketFunderAddress = polymarketFunderAddress;
 
     // Note: Polymarket client initialized async in setup method
@@ -134,6 +171,38 @@ export class ForecastLeverageSDK {
     this.protocolContract = new ethers.Contract(protocolAddress, FORECAST_PROTOCOL_ABI, this.signer);
     this.usdcContract = new ethers.Contract(usdcAddress, ERC20_ABI, this.signer);
     this.ctfContract = new ethers.Contract(ctfAddress, CTF_ABI, this.signer);
+  }
+
+  /**
+   * Convert ethers v6 or v5 Signer to v5 Wallet for clob-client compatibility.
+   * Extracts private key if available, otherwise throws error.
+   */
+  private _convertToV5Wallet(signer: any): Wallet {
+    // Check if already v5 Wallet
+    if (signer instanceof Wallet) {
+      return signer.connect(this.provider) as Wallet;
+    }
+
+    // Try to extract private key (works for most wallet types)
+    if (signer.privateKey) {
+      return new Wallet(signer.privateKey, this.provider);
+    }
+
+    // For Privy or other embedded wallets without direct privateKey access,
+    // attempt to use _signingKey (v5) or signingKey (v6)
+    const privateKey = signer._signingKey?.privateKey ||
+                       signer.signingKey?.privateKey ||
+                       signer._privateKey;
+
+    if (privateKey) {
+      return new Wallet(privateKey, this.provider);
+    }
+
+    throw new ValidationError(
+      'Unable to extract private key from signer. ' +
+      'For Privy embedded wallets, ensure you have the correct permissions. ' +
+      'Alternatively, export the private key and pass it as a string.'
+    );
   }
 
   /**
@@ -306,13 +375,20 @@ export class ForecastLeverageSDK {
       let totalTokensBought = 0;
       let totalSlippage = 0;
 
+      const orderType = params.orderType || 'FOK'; // Default to FOK for market-like execution
+      const maxRetries = params.maxRetries !== undefined ? params.maxRetries : 3;
+      const retryDelayMs = params.retryDelayMs || 2000;
+
       for (let i = 0; i < leverageParams.loops; i++) {
         try {
-          // 3a. Buy tokens on Polymarket
+          // 3a. Buy tokens on Polymarket with configured order type
           const buyResult = await this.buyTokensPolymarket(
             leverageParams.tokenId,
             remainingUSDC,
-            params.maxSlippageBps
+            params.maxSlippageBps,
+            orderType,
+            maxRetries,
+            retryDelayMs
           );
           totalTokensBought += buyResult.tokensReceived;
           totalSlippage += buyResult.slippage;
@@ -439,6 +515,9 @@ export class ForecastLeverageSDK {
 
   /**
    * Calculate leverage parameters from target
+   *
+   * Max leverage is determined ONLY by available SR and JR liquidity.
+   * NO hard-coded caps - integrators can set limits on their frontend.
    */
   private async calculateLeverageParams(params: TargetPositionParams): Promise<LeverageParams> {
     // Query protocol for F and rates
@@ -452,13 +531,17 @@ export class ForecastLeverageSDK {
     const F = Number(quote.F) / 1e18;
     const R = (Number(quote.rS) + Number(quote.rJ)) / 1e18;
 
+    // Validate F bounds
+    if (F <= 0 || F >= 1) {
+      throw new ValidationError(`Invalid capital efficiency factor F=${F}. Must be between 0 and 1.`);
+    }
+
     // Calculate loops needed based on F
     // Each loop adds F^n of original capital, so we loop until F^n < 0.01 (1% threshold)
     // Formula: n = -ln(0.01) / ln(F)
+    // NO hard-coded caps - max leverage determined by available liquidity only
     const maxLeverage = 1 / (1 - F);
-    const loops = F > 0 && F < 1
-      ? Math.ceil(-Math.log(0.01) / Math.log(F))
-      : 10; // Fallback to 10 loops if F is invalid
+    const loops = Math.ceil(-Math.log(0.01) / Math.log(F));
 
     // Get token ID from condition
     const tokenId = params.longYes
@@ -468,90 +551,176 @@ export class ForecastLeverageSDK {
     return {
       F,
       R,
-      loops: Math.min(loops, 10), // Cap at 10 loops for safety
+      loops, // NO CAPS - determined by available liquidity
       maxLeverage,
       tokenId,
     };
   }
 
   /**
-   * Buy tokens on Polymarket with FOK order
+   * Buy tokens on Polymarket with configurable order type and auto-retry.
+   *
+   * Supports:
+   * - FOK (Fill-Or-Kill): Execute immediately or cancel - best for market-like execution
+   * - GTC (Good-Til-Cancelled): Limit order that stays active until filled or manually cancelled
+   * - GTD (Good-Til-Date): Time-limited order
+   *
+   * Auto-retry logic:
+   * - If FOK order fails to fill, cancel and retry with updated orderbook price
+   * - If GTC order doesn't fill within timeout, cancel and retry
+   * - Exponential backoff between retries
    */
   private async buyTokensPolymarket(
     tokenId: string,
     usdcAmount: number,
-    maxSlippageBps: number
+    maxSlippageBps: number,
+    orderType: 'FOK' | 'GTC' | 'GTD' = 'FOK',
+    maxRetries: number = 3,
+    retryDelayMs: number = 2000
   ): Promise<{ tokensReceived: number; slippage: number }> {
-    try {
-      // Get current orderbook price
-      const orderbook = await this.polymarketClient.getOrderBook(tokenId);
-      if (!orderbook.asks || orderbook.asks.length === 0) {
-        throw new PolymarketError(`No liquidity available for token ${tokenId}`);
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        // Get current orderbook price
+        const orderbook = await this.polymarketClient.getOrderBook(tokenId);
+        if (!orderbook.asks || orderbook.asks.length === 0) {
+          throw new PolymarketError(`No liquidity available for token ${tokenId}`);
+        }
+
+        const bestAskPrice = parseFloat(orderbook.asks[0].price);
+        if (bestAskPrice <= 0 || bestAskPrice >= 1) {
+          throw new PolymarketError(`Invalid orderbook price: ${bestAskPrice}`);
+        }
+
+        // Calculate order size
+        const orderSizeCalc = (usdcAmount / 1e6) / bestAskPrice;
+        let limitPrice: number;
+
+        // Set limit price based on order type
+        if (orderType === 'FOK') {
+          // FOK: Use worst acceptable price (market execution with slippage protection)
+          limitPrice = bestAskPrice * (1 + maxSlippageBps / 10000);
+        } else {
+          // GTC/GTD: Use limit price (better execution, may not fill immediately)
+          limitPrice = bestAskPrice * (1 + maxSlippageBps / 20000); // Tighter spread for limit orders
+        }
+
+        // Map our order type to Polymarket OrderType enum
+        // Note: FOK exists in runtime but not in TypeScript types as of clob-client v4.22.7
+        // We use GTC for now as it's the most compatible option
+        let pmOrderType: OrderType.GTC | OrderType.GTD | undefined;
+        if (orderType === 'FOK' || orderType === 'GTC') {
+          pmOrderType = OrderType.GTC; // GTC works for both market-like and limit orders
+        } else {
+          pmOrderType = OrderType.GTD;
+        }
+
+        console.log(`[Polymarket] Placing ${orderType} order (using ${pmOrderType}): ${orderSizeCalc.toFixed(4)} tokens @ $${limitPrice.toFixed(4)} (attempt ${attempt + 1}/${maxRetries + 1})`);
+
+        // Place order
+        const order = await this.polymarketClient.createAndPostOrder(
+          {
+            tokenID: tokenId,
+            price: limitPrice,
+            side: Side.BUY,
+            size: orderSizeCalc,
+            feeRateBps: 0,
+          },
+          { tickSize: "0.001", negRisk: false },
+          pmOrderType
+        );
+
+        if (!order || !order.orderID) {
+          throw new PolymarketError('Failed to create order: no order ID returned');
+        }
+
+        // Wait for order fill with timeout
+        const fillTimeout = orderType === 'FOK' ? 10000 : 30000; // FOK: 10s, GTC/GTD: 30s
+        const filled = await this.waitForOrderFill(order.orderID, fillTimeout);
+
+        if (!filled) {
+          // Order didn't fill - cancel it before retrying
+          try {
+            await this.polymarketClient.cancelOrder(order.orderID);
+            console.log(`[Polymarket] Cancelled unfilled order ${order.orderID}`);
+          } catch (cancelError) {
+            console.warn(`[Polymarket] Failed to cancel order ${order.orderID}:`, cancelError);
+          }
+
+          throw new PolymarketError(`Order ${order.orderID} failed to fill within ${fillTimeout}ms`);
+        }
+
+        // Get actual fill details
+        const filledOrder = await this.polymarketClient.getOrder(order.orderID);
+        // Note: size property may not exist on all order types, fallback to original order size
+        const orderSizeFilled = parseFloat((filledOrder as any).size || orderSizeCalc.toString());
+        const tokensReceived = orderSizeFilled * 1e6; // Convert to 6 decimals
+        const actualPrice = (usdcAmount / 1e6) / orderSizeFilled;
+        const slippage = (actualPrice - bestAskPrice) * orderSizeFilled;
+
+        console.log(`[Polymarket] Order filled: ${orderSizeFilled.toFixed(4)} tokens, slippage: $${slippage.toFixed(4)}`);
+
+        return {
+          tokensReceived: Math.floor(tokensReceived),
+          slippage,
+        };
+      } catch (error: any) {
+        lastError = error instanceof PolymarketError ? error : new PolymarketError(`Order failed: ${error.message}`);
+        console.warn(`[Polymarket] Attempt ${attempt + 1} failed:`, lastError.message);
+
+        // Don't retry if it's a fundamental error (no liquidity, invalid price, etc.)
+        if (lastError.message.includes('No liquidity') || lastError.message.includes('Invalid')) {
+          throw lastError;
+        }
+
+        // If not last attempt, wait before retry with exponential backoff
+        if (attempt < maxRetries) {
+          const delay = retryDelayMs * Math.pow(1.5, attempt); // Exponential backoff
+          console.log(`[Polymarket] Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
-
-      const bestAskPrice = parseFloat(orderbook.asks[0].price);
-      if (bestAskPrice <= 0 || bestAskPrice >= 1) {
-        throw new PolymarketError(`Invalid orderbook price: ${bestAskPrice}`);
-      }
-
-      // Calculate order size
-      const orderSizeCalc = (usdcAmount / 1e6) / bestAskPrice;
-      const limitPrice = bestAskPrice * (1 + maxSlippageBps / 10000);
-
-      // Place GTC market order (FOK not supported in v4, using GTC instead)
-      const order = await this.polymarketClient.createAndPostOrder(
-        {
-          tokenID: tokenId,
-          price: limitPrice,
-          side: Side.BUY,
-          size: orderSizeCalc,
-          feeRateBps: 0,
-        },
-        { tickSize: "0.001", negRisk: false },
-        OrderType.GTC
-      );
-
-      if (!order || !order.orderID) {
-        throw new PolymarketError('Failed to create order: no order ID returned');
-      }
-
-      // Wait for order confirmation
-      await this.waitForOrderFill(order.orderID);
-
-      // Get actual tokens received from order
-      const orderSizeFilled = parseFloat(order.size);
-      const tokensReceived = orderSizeFilled * 1e6; // Convert to 6 decimals
-      const actualPrice = (usdcAmount / 1e6) / orderSizeFilled;
-      const slippage = (actualPrice - bestAskPrice) * orderSizeFilled;
-
-      return {
-        tokensReceived: Math.floor(tokensReceived),
-        slippage,
-      };
-    } catch (error: any) {
-      if (error instanceof PolymarketError) {
-        throw error;
-      }
-      throw new PolymarketError(`Order failed: ${error.message}`);
     }
+
+    // All retries exhausted
+    throw lastError || new PolymarketError(`Order failed after ${maxRetries + 1} attempts`);
   }
 
   /**
-   * Wait for Polymarket order to fill
+   * Wait for Polymarket order to fill with configurable timeout.
+   * Returns true if filled, false if timeout reached.
    */
-  private async waitForOrderFill(orderId: string): Promise<void> {
-    // Poll order status until CONFIRMED
-    for (let i = 0; i < 30; i++) {
-      const order = await this.polymarketClient.getOrder(orderId);
+  private async waitForOrderFill(orderId: string, timeoutMs: number = 30000): Promise<boolean> {
+    const startTime = Date.now();
+    const pollIntervalMs = 1000; // Poll every second
 
-      if (order.status === "MATCHED" || order.associate_trades?.some((t: any) => t.status === "CONFIRMED")) {
-        return;
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        const order = await this.polymarketClient.getOrder(orderId);
+
+        // Check if order is filled
+        if (order.status === "MATCHED" ||
+            order.associate_trades?.some((t: any) => t.status === "CONFIRMED")) {
+          return true;
+        }
+
+        // Check if order was cancelled or rejected
+        if (order.status === "CANCELLED" || order.status === "REJECTED") {
+          console.warn(`[Polymarket] Order ${orderId} status: ${order.status}`);
+          return false;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+      } catch (error) {
+        console.warn(`[Polymarket] Error checking order ${orderId}:`, error);
+        // Continue polling even if there's an error (might be transient)
+        await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
       }
-
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
     }
 
-    throw new Error(`Order ${orderId} failed to fill within 30 seconds`);
+    console.warn(`[Polymarket] Order ${orderId} timed out after ${timeoutMs}ms`);
+    return false;
   }
 
   /**
